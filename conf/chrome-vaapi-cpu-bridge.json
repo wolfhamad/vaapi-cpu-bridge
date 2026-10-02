@@ -1,0 +1,21 @@
+{
+  "name": "vaapi-cpu-bridge",
+  "platform": "raspberry-pi-5",
+  "gpu_acceleration": {
+    "enabled": true,
+    "reason": "Keep GPU decode active for H.264/H.265 and other codecs."
+  },
+  "software_av1": {
+    "advertised": true,
+    "profile": "VAProfileAV1Profile0",
+    "entrypoint": "VAEntrypointVLD",
+    "fallback_policy": "prefer_hardware_for_non_av1; use_software_av1_when_needed"
+  },
+  "chrome_launch": {
+    "flags": [
+      "--use-gl=egl",
+      "--enable-features=VaapiVideoDecoder",
+      "--enable-accelerated-video-decode"
+    ]
+  }
+}
