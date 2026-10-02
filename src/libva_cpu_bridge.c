@@ -23,16 +23,16 @@
 
 /* Global state */
 static void *g_real_driver_handle = NULL;
-static struct VADriverVTable *g_real_vtable = NULL;
+static VADriverContextP g_real_ctx = NULL;
 
 /* Real driver function pointers */
-static VAStatus (*g_real_vaQueryConfigProfiles)(VADisplay, VAProfile *, int *);
-static VAStatus (*g_real_vaQueryConfigEntrypoints)(VADisplay, VAProfile, VAEntrypoint *, int *);
+static VAStatus (*g_real_vaQueryConfigProfiles)(VADriverContextP, VAProfile *, int *);
+static VAStatus (*g_real_vaQueryConfigEntrypoints)(VADriverContextP, VAProfile, VAEntrypoint *, int *);
 
 /*
  * Load the real VA-API driver and extract the vtable.
  */
-static VAStatus load_real_driver(VADisplay dpy) {
+static VAStatus load_real_driver(void) {
     if (g_real_driver_handle != NULL) {
         return VA_STATUS_SUCCESS;
     }
@@ -50,12 +50,6 @@ static VAStatus load_real_driver(VADisplay dpy) {
         return VA_STATUS_ERROR_UNKNOWN;
     }
 
-    /* Extract function pointers from the real driver */
-    g_real_vaQueryConfigProfiles = (VAStatus (*)(VADisplay, VAProfile *, int *))
-        dlsym(g_real_driver_handle, "vaQueryConfigProfiles");
-    g_real_vaQueryConfigEntrypoints = (VAStatus (*)(VADisplay, VAProfile, VAEntrypoint *, int *))
-        dlsym(g_real_driver_handle, "vaQueryConfigEntrypoints");
-
     fprintf(stderr, "[vaapi-cpu-bridge] Real driver loaded successfully\n");
     return VA_STATUS_SUCCESS;
 }
@@ -64,14 +58,14 @@ static VAStatus load_real_driver(VADisplay dpy) {
  * Hook: vaQueryConfigProfiles
  * Inject VAProfileAV1Profile0 alongside hardware profiles.
  */
-static VAStatus vaapi_QueryConfigProfiles(VADisplay dpy, VAProfile *profile_list, int *num_profiles) {
-    if (!g_real_vaQueryConfigProfiles) {
+static VAStatus vaapi_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list, int *num_profiles) {
+    if (!g_real_vaQueryConfigProfiles || !g_real_ctx) {
         fprintf(stderr, "[vaapi-cpu-bridge] Real vaQueryConfigProfiles not available\n");
         return VA_STATUS_ERROR_UNKNOWN;
     }
 
     /* Call the real driver */
-    VAStatus status = g_real_vaQueryConfigProfiles(dpy, profile_list, num_profiles);
+    VAStatus status = g_real_vaQueryConfigProfiles(g_real_ctx, profile_list, num_profiles);
     if (status != VA_STATUS_SUCCESS) {
         return status;
     }
@@ -99,7 +93,7 @@ static VAStatus vaapi_QueryConfigProfiles(VADisplay dpy, VAProfile *profile_list
  * Hook: vaQueryConfigEntrypoints
  * Provide VLD entrypoint for AV1 decode.
  */
-static VAStatus vaapi_QueryConfigEntrypoints(VADisplay dpy, VAProfile profile,
+static VAStatus vaapi_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile,
                                                VAEntrypoint *entrypoint_list, int *num_entrypoints) {
     if (profile == VAProfileAV1Profile0) {
         /* For AV1, we provide a software decode entrypoint */
@@ -112,23 +106,13 @@ static VAStatus vaapi_QueryConfigEntrypoints(VADisplay dpy, VAProfile profile,
     }
 
     /* For other profiles, proxy to the real driver */
-    if (!g_real_vaQueryConfigEntrypoints) {
+    if (!g_real_vaQueryConfigEntrypoints || !g_real_ctx) {
         fprintf(stderr, "[vaapi-cpu-bridge] Real vaQueryConfigEntrypoints not available\n");
         return VA_STATUS_ERROR_UNKNOWN;
     }
 
-    return g_real_vaQueryConfigEntrypoints(dpy, profile, entrypoint_list, num_entrypoints);
+    return g_real_vaQueryConfigEntrypoints(g_real_ctx, profile, entrypoint_list, num_entrypoints);
 }
-
-/*
- * VA-API driver vtable setup.
- * This is the core of the libva driver interface.
- */
-static struct VADriverVTable g_vtable = {
-    .vaQueryConfigProfiles = vaapi_QueryConfigProfiles,
-    .vaQueryConfigEntrypoints = vaapi_QueryConfigEntrypoints,
-    /* Other functions will be filled by loading the real driver's vtable */
-};
 
 /*
  * libva driver entry point: __vaDriverInit_1_0
@@ -143,13 +127,13 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     }
 
     /* Load the real driver first */
-    VAStatus status = load_real_driver(ctx->display);
+    VAStatus status = load_real_driver();
     if (status != VA_STATUS_SUCCESS) {
         fprintf(stderr, "[vaapi-cpu-bridge] Failed to load real driver\n");
         return status;
     }
 
-    /* Try to get the real driver's vtable by calling its init function */
+    /* Try to get the real driver's init function */
     typedef VAStatus (*vaDriverInit_func)(VADriverContextP);
     vaDriverInit_func real_init = (vaDriverInit_func)dlsym(g_real_driver_handle, "__vaDriverInit_1_0");
     
@@ -158,21 +142,38 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         return VA_STATUS_ERROR_UNKNOWN;
     }
 
-    /* Initialize the real driver context */
-    status = real_init(ctx);
+    /* Create a temporary context to initialize the real driver */
+    g_real_ctx = (VADriverContextP)malloc(sizeof(struct VADriverContext));
+    if (!g_real_ctx) {
+        fprintf(stderr, "[vaapi-cpu-bridge] Failed to allocate context\n");
+        return VA_STATUS_ERROR_UNKNOWN;
+    }
+
+    memcpy(g_real_ctx, ctx, sizeof(struct VADriverContext));
+
+    /* Initialize the real driver */
+    status = real_init(g_real_ctx);
     if (status != VA_STATUS_SUCCESS) {
         fprintf(stderr, "[vaapi-cpu-bridge] Real driver initialization failed\n");
+        free(g_real_ctx);
+        g_real_ctx = NULL;
         return status;
     }
 
-    /* Save the real vtable */
-    g_real_vtable = ctx->vtable;
+    /* Extract function pointers from the real driver's vtable */
+    if (g_real_ctx->vtable) {
+        g_real_vaQueryConfigProfiles = g_real_ctx->vtable->vaQueryConfigProfiles;
+        g_real_vaQueryConfigEntrypoints = g_real_ctx->vtable->vaQueryConfigEntrypoints;
+    }
+
+    /* Copy the real driver's vtable to our context */
+    if (g_real_ctx->vtable) {
+        memcpy(ctx->vtable, g_real_ctx->vtable, sizeof(struct VADriverVTable));
+    }
 
     /* Override only the functions we want to intercept */
-    if (ctx->vtable) {
-        ctx->vtable->vaQueryConfigProfiles = vaapi_QueryConfigProfiles;
-        ctx->vtable->vaQueryConfigEntrypoints = vaapi_QueryConfigEntrypoints;
-    }
+    ctx->vtable->vaQueryConfigProfiles = vaapi_QueryConfigProfiles;
+    ctx->vtable->vaQueryConfigEntrypoints = vaapi_QueryConfigEntrypoints;
 
     fprintf(stderr, "[vaapi-cpu-bridge] Driver initialized successfully\n");
     return VA_STATUS_SUCCESS;
